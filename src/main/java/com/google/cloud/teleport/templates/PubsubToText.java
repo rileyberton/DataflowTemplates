@@ -20,12 +20,14 @@ package com.google.cloud.teleport.templates;
 
 import com.google.cloud.teleport.io.WindowedFilenamePolicy;
 import com.google.cloud.teleport.util.DurationUtils;
+import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.io.FileBasedSink;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.fs.ResourceId;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
+import org.apache.beam.sdk.io.gcp.pubsub.PubsubMessage;
 import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
@@ -37,6 +39,14 @@ import org.apache.beam.sdk.options.ValueProvider.NestedValueProvider;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.windowing.FixedWindows;
 import org.apache.beam.sdk.transforms.windowing.Window;
+import org.apache.beam.sdk.transforms.Count;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.Filter;
+import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PDone;
+import org.apache.beam.sdk.transforms.PTransform;
 
 /**
  * This pipeline ingests incoming data from a Cloud Pub/Sub topic and
@@ -56,10 +66,12 @@ import org.apache.beam.sdk.transforms.windowing.Window;
  --runner=DataflowRunner \
  --windowDuration=2m \
  --numShards=1 \
- --inputTopic=projects/${PROJECT_ID}/topics/windowed-files \
+ --inputSubscription=projects/${PROJECT_ID}/subscriptions/my-subscription  \ #has to exist
  --outputDirectory=gs://${PROJECT_ID}/temp/ \
  --outputFilenamePrefix=windowed-file \
- --outputFilenameSuffix=.txt"
+ --outputFilenameSuffix=.txt" \
+ --diskSizeGb=1000 \
+ --workerDiskType=compute.googleapis.com/projects/zones/diskTypes/pd-ssd
  * </pre>
  * </p>
  */
@@ -70,11 +82,11 @@ public class PubsubToText {
    *
    * <p>Inherits standard configuration options.</p>
    */
-  public interface Options extends PipelineOptions, StreamingOptions {
-    @Description("The Cloud Pub/Sub topic to read from.")
+  public interface Options extends DataflowPipelineOptions {
+    @Description("The Cloud Pub/Sub subscription to read from.")
     @Required
-    ValueProvider<String> getInputTopic();
-    void setInputTopic(ValueProvider<String> value);
+    ValueProvider<String> getInputSubscription();
+    void setInputSubscription(ValueProvider<String> value);
 
     @Description("The directory to output files to. Must end with a slash.")
     @Required
@@ -112,6 +124,7 @@ public class PubsubToText {
     @Default.String("5m")
     String getWindowDuration();
     void setWindowDuration(String value);
+
   }
 
   /**
@@ -126,6 +139,7 @@ public class PubsubToText {
         .as(Options.class);
 
     options.setStreaming(true);
+    options.setUsePublicIps(false);
 
     run(options);
   }
@@ -142,24 +156,30 @@ public class PubsubToText {
 
     /*
      * Steps:
-     *   1) Read string messages from PubSub
-     *   2) Window the messages into minute intervals specified by the executor.
-     *   3) Output the windowed files to GCS
+     *   1) Read pubsub messages from PubSub subscription
+     *   2) Convert the pubsub to it's string representation
+     *   3) Window the messages into minute intervals specified by the executor.
+     *   4) Output the windowed files to GCS
      */
-    pipeline
-        .apply("Read PubSub Events", PubsubIO.readStrings().fromTopic(options.getInputTopic()))
-        .apply(
-            options.getWindowDuration() + " Window",
-            Window.into(FixedWindows.of(DurationUtils.parseDuration(options.getWindowDuration()))))
+    PCollection<PubsubMessage> pubsubMessagePCollection = pipeline.apply("Read PubSub messages", PubsubIO.readMessages().fromSubscription(options.getInputSubscription()));
+    PDone serialisationBranch = pubsubMessagePCollection
+      .apply("PubSub message payload extraction", ParDo.of(new DoFn<PubsubMessage, String>() {
+          @ProcessElement
+          public void processElement(@Element PubsubMessage pubsubMessage, OutputReceiver<String> receiver) {
+            String element = new String(pubsubMessage.getPayload());
+            receiver.output(element);
+          }
+        }))
+      .apply(options.getWindowDuration() + " Window",
+             Window.into(FixedWindows.of(DurationUtils.parseDuration(options.getWindowDuration()))))
 
-        // Apply windowed file writes. Use a NestedValueProvider because the filename
-        // policy requires a resourceId generated from the input value at runtime.
-        .apply(
-            "Write File(s)",
-            TextIO.write()
-                .withWindowedWrites()
-                .withNumShards(options.getNumShards())
-                .to(
+      // Apply windowed file writes. Use a NestedValueProvider because the filename
+      // policy requires a resourceId generated from the input value at runtime.
+      .apply("Write File(s)",
+             TextIO.write()
+               .withWindowedWrites()
+               .withNumShards(options.getNumShards())
+               .to(
                     new WindowedFilenamePolicy(
                         options.getOutputDirectory(),
                         options.getOutputFilenamePrefix(),
