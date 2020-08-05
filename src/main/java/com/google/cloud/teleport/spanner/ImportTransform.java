@@ -56,9 +56,9 @@ import org.apache.beam.sdk.io.FileSystems;
 import org.apache.beam.sdk.io.fs.EmptyMatchTreatment;
 import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.io.fs.ResourceId;
-import org.apache.beam.sdk.io.gcp.spanner.SpannerAccessor;
+import org.apache.beam.sdk.io.gcp.spanner.ExposedSpannerAccessor;
+import org.apache.beam.sdk.io.gcp.spanner.LocalSpannerIO;
 import org.apache.beam.sdk.io.gcp.spanner.SpannerConfig;
-import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
 import org.apache.beam.sdk.io.gcp.spanner.SpannerWriteResult;
 import org.apache.beam.sdk.io.gcp.spanner.Transaction;
 import org.apache.beam.sdk.options.ValueProvider;
@@ -76,9 +76,13 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionList;
+import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.PDone;
+import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptor;
+import org.joda.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -90,16 +94,26 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
 
   private final SpannerConfig spannerConfig;
   private final ValueProvider<String> importDirectory;
-  // If true wait for indexes, useful for testing not recommended in practice.
+  // By default the import pipeline is not blocked on index or foreign key creation, and it
+  // may complete with indexes or foreign keys still being created in the background. In testing,
+  // it may be useful to wait until indexes and foreign keys are finished for verification.
+  // If the following two fields are true, the transform will wait until indexes and foreign keys
+  // are finished, respectively.
   private final ValueProvider<Boolean> waitForIndexes;
+  private final ValueProvider<Boolean> waitForForeignKeys;
+  private final ValueProvider<Boolean> earlyIndexCreateFlag;
 
   public ImportTransform(
       SpannerConfig spannerConfig,
       ValueProvider<String> importDirectory,
-      ValueProvider<Boolean> waitForIndexes) {
+      ValueProvider<Boolean> waitForIndexes,
+      ValueProvider<Boolean> waitForForeignKeys,
+      ValueProvider<Boolean> earlyIndexCreateFlag) {
     this.spannerConfig = spannerConfig;
     this.importDirectory = importDirectory;
     this.waitForIndexes = waitForIndexes;
+    this.waitForForeignKeys = waitForForeignKeys;
+    this.earlyIndexCreateFlag = earlyIndexCreateFlag;
   }
 
   @Override
@@ -133,7 +147,7 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
         schemas.apply("Build avro DDL", Combine.globally(AsList.fn()));
 
     PCollectionView<Transaction> tx =
-        begin.apply(SpannerIO.createTransaction().withSpannerConfig(spannerConfig));
+        begin.apply(LocalSpannerIO.createTransaction().withSpannerConfig(spannerConfig));
 
     PCollection<Ddl> informationSchemaDdl =
         begin.apply("Read Information Schema", new ReadInformationSchema(spannerConfig, tx));
@@ -143,10 +157,19 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
     final PCollectionView<Ddl> informationSchemaView =
         informationSchemaDdl.apply("Information schema view", View.asSingleton());
 
-    final PCollection<Ddl> ddl =
+    final PCollectionTuple createTableOutput =
         begin.apply(
-            "Create Cloud Spanner Tables",
-            new CreateTables(spannerConfig, avroDdlView, informationSchemaView));
+            "Create Cloud Spanner Tables and indexes",
+            new CreateTables(spannerConfig, avroDdlView, informationSchemaView,
+                             earlyIndexCreateFlag));
+
+    final PCollection<Ddl> ddl = createTableOutput.get(CreateTables.getDdlObjectTag());
+    final PCollectionView<List<String>> pendingIndexes =
+        createTableOutput.get(CreateTables.getPendingIndexesTag())
+            .apply("As Index view", View.asSingleton());
+    final PCollectionView<List<String>> pendingForeignKeys =
+        createTableOutput.get(CreateTables.getPendingForeignKeysTag())
+            .apply("As Foreign keys view", View.asSingleton());
 
     PCollectionView<Ddl> ddlView = ddl.apply("Cloud Spanner DDL as view", View.asSingleton());
 
@@ -187,38 +210,46 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
       final int depth = i;
       PCollection<KV<String, String>> levelFiles =
           acc.apply(
-              "Store depth " + depth,
-              ParDo.of(
-                      new DoFn<HashMultimap<String, String>, KV<String, String>>() {
+                  "Get Avro filenames depth " + depth,
+                  ParDo.of(
+                          new DoFn<HashMultimap<String, String>, KV<String, String>>() {
 
-                        @ProcessElement
-                        public void processElement(ProcessContext c) {
-                          HashMultimap<String, String> allFiles = c.element();
-                          HashMultimap<Integer, String> levels = c.sideInput(levelsView);
+                            @ProcessElement
+                            public void processElement(ProcessContext c) {
+                              HashMultimap<String, String> allFiles = c.element();
+                              HashMultimap<Integer, String> levels = c.sideInput(levelsView);
 
-                          Set<String> tables = levels.get(depth);
-                          for (String table : tables) {
-                            for (String file : allFiles.get(table)) {
-                              c.output(KV.of(file, table));
+                              Set<String> tables = levels.get(depth);
+                              for (String table : tables) {
+                                for (String file : allFiles.get(table)) {
+                                  c.output(KV.of(file, table));
+                                }
+                              }
                             }
-                          }
-                        }
-                      })
-                  .withSideInputs(levelsView));
+                          })
+                      .withSideInputs(levelsView))
+              .apply("Wait for previous depth " + depth, Wait.on(previousComputation));
       PCollection<Mutation> mutations =
           levelFiles.apply(
               "Avro files as mutations " + depth, new AvroTableFileAsMutations(ddlView));
 
       SpannerWriteResult result =
-          mutations
-              .apply("Wait for previous depth " + depth, Wait.on(previousComputation))
-              .apply(
-                  "Write mutations " + depth,
-                  SpannerIO.write().withSchemaReadySignal(ddl).withSpannerConfig(spannerConfig));
+          mutations.apply(
+              "Write mutations " + depth,
+              LocalSpannerIO.write()
+                  .withSchemaReadySignal(ddl)
+                  .withSpannerConfig(spannerConfig)
+                  .withCommitDeadline(Duration.standardMinutes(1))
+                  .withMaxCumulativeBackoff(Duration.standardHours(2))
+                  .withMaxNumMutations(10000)
+                  .withGroupingFactor(100));
       previousComputation = result.getOutput();
     }
     ddl.apply(Wait.on(previousComputation))
-        .apply("Create Indexes", new CreateIndexesTransform(spannerConfig, waitForIndexes));
+       .apply("Create Indexes", new ApplyDDLTransform(spannerConfig,
+              pendingIndexes, waitForIndexes))
+       .apply("Add Foreign Keys", new ApplyDDLTransform(spannerConfig,
+              pendingForeignKeys, waitForForeignKeys));
     return PDone.in(begin.getPipeline());
   }
 
@@ -297,26 +328,51 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
     }
   }
 
-  private static class CreateTables extends PTransform<PBegin, PCollection<Ddl>> {
+  private static class CreateTables extends PTransform<PBegin, PCollectionTuple> {
 
     private final SpannerConfig spannerConfig;
 
     private final PCollectionView<List<KV<String, String>>> avroSchemasView;
     private final PCollectionView<Ddl> informationSchemaView;
+    private final ValueProvider<Boolean> earlyIndexCreateFlag;
 
-    private transient SpannerAccessor spannerAccessor;
+    private transient ExposedSpannerAccessor spannerAccessor;
+
+    /* If the schema has a lot of DDL changes after dataload, its preferable to create
+     * them before dataload. This provides the threshold for the early creation.
+     */
+    private static final int EARLY_INDEX_CREATE_THRESHOLD = 40;
+
+    public static TupleTag<Ddl> getDdlObjectTag() {
+      return ddlObjectTag;
+    }
+
+    public static TupleTag<List<String>> getPendingIndexesTag() {
+      return pendingIndexesTag;
+    }
+
+    public static TupleTag<List<String>> getPendingForeignKeysTag() {
+      return pendingForeignKeysTag;
+    }
+
+    private static final TupleTag<Ddl> ddlObjectTag = new TupleTag<Ddl>(){};
+    private static final TupleTag<List<String>> pendingIndexesTag = new TupleTag<List<String>>(){};
+    private static final TupleTag<List<String>> pendingForeignKeysTag
+        = new TupleTag<List<String>>(){};
 
     public CreateTables(
         SpannerConfig spannerConfig,
         PCollectionView<List<KV<String, String>>> avroSchemasView,
-        PCollectionView<Ddl> informationSchemaView) {
+        PCollectionView<Ddl> informationSchemaView,
+        ValueProvider<Boolean> earlyIndexCreateFlag) {
       this.spannerConfig = spannerConfig;
       this.avroSchemasView = avroSchemasView;
       this.informationSchemaView = informationSchemaView;
+      this.earlyIndexCreateFlag = earlyIndexCreateFlag;
     }
 
     @Override
-    public PCollection<Ddl> expand(PBegin begin) {
+    public PCollectionTuple expand(PBegin begin) {
       return begin
           .apply(Create.of(1))
           .apply(
@@ -325,7 +381,7 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
 
                         @Setup
                         public void setup() {
-                          spannerAccessor = spannerConfig.connectToSpanner();
+                          spannerAccessor = ExposedSpannerAccessor.create(spannerConfig);
                         }
 
                         @Teardown
@@ -350,6 +406,8 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
                             }
                           }
                           AvroSchemaToDdlConverter converter = new AvroSchemaToDdlConverter();
+                          List<String> createIndexStatements = new ArrayList<>();
+                          List<String> createForeignKeyStatements = new ArrayList<>();
                           if (!missingTables.isEmpty()) {
                             Ddl.Builder mergedDdl = informationSchemaDdl.toBuilder();
                             Ddl.Builder builder = Ddl.builder();
@@ -357,17 +415,40 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
                               Table table = converter.toTable(kv.getKey(), kv.getValue());
                               builder.addTable(table);
                               mergedDdl.addTable(table);
+                              // Account for additional DDL changes for tables being created
+                              createIndexStatements.addAll(table.indexes());
+                              createForeignKeyStatements.addAll(table.foreignKeys());
                             }
                             DatabaseAdminClient databaseAdminClient =
                                 spannerAccessor.getDatabaseAdminClient();
 
                             Ddl newDdl = builder.build();
+                            List<String> ddlStatements = new ArrayList<>();
+                            ddlStatements.addAll(newDdl.createTableStatements());
+
+                            // If the total DDL statements exceed the threshold, execute the create
+                            // index statements when tables are created.
+                            // Note that foreign keys can only be created after data load
+                            // because if we tried to create them before data load, we would
+                            // need to load rows in a specific order (insert the referenced
+                            // row first before the referencing row). This is not always
+                            // possible since foreign keys may introduce circular relationships.
+                            if (earlyIndexCreateFlag.get()
+                                    && ((createForeignKeyStatements.size()
+                                        + createIndexStatements.size())
+                                        >= EARLY_INDEX_CREATE_THRESHOLD)) {
+                              ddlStatements.addAll(createIndexStatements);
+                              c.output(pendingIndexesTag, new ArrayList<String>());
+                            } else {
+                              c.output(pendingIndexesTag, createIndexStatements);
+                            }
+                            c.output(pendingForeignKeysTag, createForeignKeyStatements);
 
                             OperationFuture<Void, UpdateDatabaseDdlMetadata> op =
                                 databaseAdminClient.updateDatabaseDdl(
                                     spannerConfig.getInstanceId().get(),
                                     spannerConfig.getDatabaseId().get(),
-                                    newDdl.createTableStatements(),
+                                    ddlStatements,
                                     null);
 
                             try {
@@ -382,9 +463,14 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
                             return;
                           }
                           c.output(informationSchemaDdl);
-                        }
+                          // In case of no tables, add empty list
+                          c.output(pendingIndexesTag, createIndexStatements);
+                          c.output(pendingForeignKeysTag, createForeignKeyStatements);
+                      }
                       })
-                  .withSideInputs(avroSchemasView, informationSchemaView));
+                  .withSideInputs(avroSchemasView, informationSchemaView)
+                  .withOutputTags(ddlObjectTag,
+                      TupleTagList.of(pendingIndexesTag).and(pendingForeignKeysTag)));
     }
   }
 

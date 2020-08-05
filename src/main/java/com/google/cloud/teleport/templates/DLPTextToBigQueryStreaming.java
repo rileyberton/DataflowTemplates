@@ -63,6 +63,7 @@ import org.apache.beam.sdk.options.Validation.Required;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.options.ValueProvider.NestedValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.DoFn.Element;
 import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.View;
@@ -72,6 +73,7 @@ import org.apache.beam.sdk.transforms.splittabledofn.OffsetRangeTracker;
 import org.apache.beam.sdk.transforms.splittabledofn.RestrictionTracker;
 import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
 import org.apache.beam.sdk.transforms.windowing.FixedWindows;
+import org.apache.beam.sdk.transforms.windowing.Repeatedly;
 import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
@@ -174,7 +176,7 @@ public class DLPTextToBigQueryStreaming {
     Pipeline p = Pipeline.create(options);
     /*
      * Steps:
-     *   1) Read from the text source continuously based on default interval e.g. 300 seconds
+     *   1) Read from the text source continuously based on default interval e.g. 30 seconds
      *       - Setup a window for 30 secs to capture the list of files emited.
      *       - Group by file name as key and ReadableFile as a value.
      *   2) Create a side input for the window containing list of headers par file.
@@ -203,8 +205,8 @@ public class DLPTextToBigQueryStreaming {
             .apply(
                 "Fixed Window(30 Sec)",
                 Window.<KV<String, ReadableFile>>into(FixedWindows.of(WINDOW_INTERVAL))
-                    .triggering(
-                        AfterProcessingTime.pastFirstElementInPane().plusDelayOf(Duration.ZERO))
+                    .triggering(Repeatedly.forever(
+                        AfterProcessingTime.pastFirstElementInPane().plusDelayOf(Duration.ZERO)))
                     .discardingFiredPanes()
                     .withAllowedLateness(Duration.ZERO))
             .apply(GroupByKey.create());
@@ -442,7 +444,7 @@ public class DLPTextToBigQueryStreaming {
      * @throws IOException
      */
     @GetInitialRestriction
-    public OffsetRange getInitialRestriction(KV<String, ReadableFile> csvFile) throws IOException {
+    public OffsetRange getInitialRestriction(@Element KV<String, ReadableFile> csvFile) throws IOException {
 
       int rowCount = 0;
       int totalSplit = 0;
@@ -476,7 +478,7 @@ public class DLPTextToBigQueryStreaming {
      */
     @SplitRestriction
     public void splitRestriction(
-        KV<String, ReadableFile> csvFile, OffsetRange range, OutputReceiver<OffsetRange> out) {
+        @Element KV<String, ReadableFile> csvFile,@Restriction OffsetRange range, OutputReceiver<OffsetRange> out) {
       /** split the initial restriction by 1 */
       for (final OffsetRange p : range.split(1, 1)) {
         out.output(p);
@@ -484,7 +486,7 @@ public class DLPTextToBigQueryStreaming {
     }
 
     @NewTracker
-    public OffsetRangeTracker newTracker(OffsetRange range) {
+    public OffsetRangeTracker newTracker(@Restriction OffsetRange range) {
       return new OffsetRangeTracker(new OffsetRange(range.getFrom(), range.getTo()));
     }
 

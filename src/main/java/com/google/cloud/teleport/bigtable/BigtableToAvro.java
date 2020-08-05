@@ -158,7 +158,7 @@ public class BigtableToAvro {
    * @param byteString A {@link ByteString} from which to extract the array.
    * @return an array of byte.
    */
-  private static byte[] toByteArray(final ByteString byteString) {
+  protected static byte[] toByteArray(final ByteString byteString) {
     try {
       ZeroCopyByteOutput byteOutput = new ZeroCopyByteOutput();
       UnsafeByteOperations.unsafeWriteTo(byteString, byteOutput);

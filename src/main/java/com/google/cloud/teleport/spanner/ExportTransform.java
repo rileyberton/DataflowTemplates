@@ -15,11 +15,14 @@
  */
 package com.google.cloud.teleport.spanner;
 
+import com.google.cloud.spanner.BatchReadOnlyTransaction;
 import com.google.cloud.spanner.Struct;
+import com.google.cloud.spanner.TimestampBound;
 import com.google.cloud.teleport.spanner.ExportProtos.Export;
 import com.google.cloud.teleport.spanner.ExportProtos.TableManifest;
 import com.google.cloud.teleport.spanner.ddl.Ddl;
 import com.google.cloud.teleport.spanner.ddl.Table;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.base.Supplier;
 import com.google.common.collect.Iterables;
@@ -62,9 +65,10 @@ import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.WriteFilesResult;
 import org.apache.beam.sdk.io.fs.ResolveOptions;
 import org.apache.beam.sdk.io.fs.ResourceId;
+import org.apache.beam.sdk.io.gcp.spanner.ExposedSpannerAccessor;
+import org.apache.beam.sdk.io.gcp.spanner.LocalSpannerIO;
 import org.apache.beam.sdk.io.gcp.spanner.ReadOperation;
 import org.apache.beam.sdk.io.gcp.spanner.SpannerConfig;
-import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
 import org.apache.beam.sdk.io.gcp.spanner.Transaction;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.Combine;
@@ -117,14 +121,25 @@ public class ExportTransform extends PTransform<PBegin, WriteFilesResult<String>
   private final SpannerConfig spannerConfig;
   private final ValueProvider<String> outputDir;
   private final ValueProvider<String> testJobId;
+  private final ValueProvider<String> snapshotTime;
 
   public ExportTransform(
       SpannerConfig spannerConfig,
       ValueProvider<String> outputDir,
       ValueProvider<String> testJobId) {
+    this(spannerConfig, outputDir, testJobId,
+         /* snapshotTime= */ ValueProvider.StaticValueProvider.of(""));
+  }
+
+  public ExportTransform(
+      SpannerConfig spannerConfig,
+      ValueProvider<String> outputDir,
+      ValueProvider<String> testJobId,
+      ValueProvider<String> snapshotTime) {
     this.spannerConfig = spannerConfig;
     this.outputDir = outputDir;
     this.testJobId = testJobId;
+    this.snapshotTime = snapshotTime;
   }
 
   /**
@@ -134,8 +149,20 @@ public class ExportTransform extends PTransform<PBegin, WriteFilesResult<String>
   @Override
   public WriteFilesResult<String> expand(PBegin begin) {
     Pipeline p = begin.getPipeline();
-    PCollectionView<Transaction> tx =
-        p.apply(SpannerIO.createTransaction().withSpannerConfig(spannerConfig));
+
+    /*
+     * Allow users to specify read timestamp.
+     * CreateTransaction and CreateTransactionFn classes in SpannerIO
+     * only take a timestamp object for exact staleness which works when
+     * parameters are provided during template compile time. They do not work with
+     * a Timestamp valueProvider which can take parameters at runtime. Hence a new
+     * ParDo class CreateTransactionFnWithTimestamp had to be created for this
+     * purpose.
+     */
+    PCollectionView<Transaction> tx = p.apply("CreateTransaction", Create.of(1))
+        .apply("Create transaction", ParDo.of(new CreateTransactionFnWithTimestamp(spannerConfig)))
+        .apply("As PCollectionView", View.asSingleton());
+
     PCollection<Ddl> ddl =
         p.apply("Read Information Schema", new ReadInformationSchema(spannerConfig, tx));
     PCollection<ReadOperation> tables =
@@ -208,7 +235,7 @@ public class ExportTransform extends PTransform<PBegin, WriteFilesResult<String>
     PCollection<Struct> rows =
         tables.apply(
             "Read all rows from Spanner",
-            SpannerIO.readAll().withTransaction(tx).withSpannerConfig(spannerConfig));
+            LocalSpannerIO.readAll().withTransaction(tx).withSpannerConfig(spannerConfig));
 
     ValueProvider<ResourceId> resource =
         ValueProvider.NestedValueProvider.of(
@@ -403,10 +430,10 @@ public class ExportTransform extends PTransform<PBegin, WriteFilesResult<String>
     @Override
     public Schema getSchema(String tableName) {
       Map<String, SerializableSchemaSupplier> si = sideInput(avroSchemas);
-      // Check if there are any schemas available.
-      if (si.isEmpty()) {
+      // Check if there are any schemas available or if the table it is EMPTY_EXPORT_FILE
+      if (si.isEmpty() || tableName.equals(EMPTY_EXPORT_FILE)) {
         // The EMPTY_EXPORT_FILE still needs to have a rudimentary schema for it to be created.
-        return SchemaBuilder.record("EmptyDB").fields().endRecord();
+        return SchemaBuilder.record("Empty").fields().endRecord();
       }
       return si.get(tableName).get();
     }
@@ -549,6 +576,74 @@ public class ExportTransform extends PTransform<PBegin, WriteFilesResult<String>
 
   private static String tableManifestFileName(String tableName) {
     return tableName + "-manifest.json";
+  }
+
+  /*
+   * A DoFn that creates a transaction for read that honors
+   * the timestamp valueprovider parameter.
+   * From org.apache.beam.sdk.io.gcp.spanner.CreateTransactionFn
+   */
+  class CreateTransactionFnWithTimestamp extends DoFn<Object, Transaction> {
+    private final SpannerConfig config;
+
+    CreateTransactionFnWithTimestamp(SpannerConfig config) {
+      this.config = config;
+    }
+
+    private transient ExposedSpannerAccessor spannerAccessor;
+
+    @DoFn.Setup
+    public void setup() throws Exception {
+      spannerAccessor = ExposedSpannerAccessor.create(config);
+    }
+
+    @Teardown
+    public void teardown() throws Exception {
+      spannerAccessor.close();
+    }
+
+    @ProcessElement
+    public void processElement(ProcessContext c) throws Exception {
+      String timestamp = ExportTransform.this.snapshotTime.get();
+
+      TimestampBound tsb = createTimestampBound(timestamp);
+      BatchReadOnlyTransaction tx =
+        spannerAccessor.getBatchClient().batchReadOnlyTransaction(tsb);
+      c.output(Transaction.create(tx.getBatchTransactionId()));
+    }
+  }
+
+  @VisibleForTesting
+  static TimestampBound createTimestampBound(String timestamp) {
+    if ("".equals(timestamp)) {
+      /* If no timestamp is specified, read latest data */
+      return TimestampBound.strong();
+    } else {
+      /* Else try to read data in the timestamp specified. */
+      com.google.cloud.Timestamp tsVal;
+      try {
+        tsVal = com.google.cloud.Timestamp.parseTimestamp(timestamp);
+      } catch (Exception e) {
+        throw new IllegalStateException("Invalid timestamp specified " + timestamp);
+      }
+
+      /*
+       * If timestamp specified is in the future, spanner read will wait
+       * till the time has passed. Abort the job and complain early.
+       */
+      if (tsVal.compareTo(com.google.cloud.Timestamp.now()) > 0) {
+        throw new IllegalStateException("Timestamp specified is in future " + timestamp);
+      }
+
+      /*
+       * Export jobs with Timestamps which are older than
+       * maximum staleness time (one hour) fail with the FAILED_PRECONDITION
+       * error - https://cloud.google.com/spanner/docs/timestamp-bounds
+       * Hence we do not handle the case.
+       */
+
+      return TimestampBound.ofReadTimestamp(tsVal);
+    }
   }
 
   /**
